@@ -17,6 +17,7 @@
     "moment-timezone": "^0.5.45",
     "fs-extra": "^11.2.0",
     "dotenv": "^16.3.1",
+    "link-preview-js": "^3.0.5",
     "split-file": "^2.2.5",
     "chama-bailez-pro": "3.3.2",
     "@ffmpeg-installer/ffmpeg": "^1.1.0"

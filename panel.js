@@ -69,7 +69,7 @@ export function createPanelRouter({ Session, loadUserConfig, updateUserConfig, c
     const view = async (number) => {
         const cfg = await loadUserConfig(number);
         const live = activeSockets.get(number);
-        const out = { number, online: !!(live && live.socket && live.socket.user), text: {}, flags: {} };
+        const out = { number, online: !!(live && live.socket && live.socket.user && live.socket.ws?.isOpen !== false && live.socket.ws?.isClosed !== true), text: {}, flags: {} };
         for (const k of Object.keys(TEXT_FIELDS)) out.text[k] = String(cfg[k] ?? '');
         out.text.BOT_IMAGE = String(cfg.BOT_IMAGE ?? '');
         for (const k of BOOL_FIELDS) out.flags[k] = String(cfg[k]) === 'true';

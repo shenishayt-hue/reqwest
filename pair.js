@@ -631,6 +631,16 @@ const configPushers = new Map(); // number -> (newConfig) => live bot ekata ikma
 const configSyncStreams = new Map();
 const presenceIntervals = new Map();
 
+// 🔧 FIX: number ekakata *eka* current socket ekak witharai. Palaya socket eke late 'close' event eka
+//         aluth socket eke interval / configPusher delete karanna epa (panel update wenne nathi wenna hethuwa).
+const currentSocket = new Map();   // number -> live socket object
+const resetTokens = new Map();     // number -> counter (web eken re-pair karaddi palaya reconnect loops nawathanna)
+const reconnectCounts = new Map(); // number -> consecutive reconnect attempts (open unama witharai reset wenne)
+// socket eka sargayen WhatsApp ekata connect da (ws open + login una)
+function isLive(e) {
+    return !!(e && e.socket && e.socket.user && e.socket.ws?.isOpen !== false && e.socket.ws?.isClosed !== true);
+}
+
 function clearNumberIntervals(sanitizedNumber) {
     configPushers.delete(sanitizedNumber);
     if (configSyncIntervals.has(sanitizedNumber)) {
@@ -1651,6 +1661,13 @@ async function autoReconnectOnStartup() {
             return;
         }
 
+        // 🔧 FIX: waradi numbers (0701838331 wage local format / digit kam) reconnect karanna epa
+        const before = numbers.length;
+        const junk = numbers.filter(n => !/^[1-9]\d{8,14}$/.test(String(n)));
+        for (const j of junk) await deleteSession(String(j)).catch(() => {});
+        numbers = numbers.filter(n => /^[1-9]\d{8,14}$/.test(String(n)));
+        if (before !== numbers.length) console.log(`🧹 Removed ${before - numbers.length} invalid numbers: ${junk.join(', ')}`);
+
         console.log(`Attempting to reconnect ${numbers.length} sessions...`);
         for (const number of numbers) {
             if (activeSockets.has(number)) {
@@ -1659,7 +1676,7 @@ async function autoReconnectOnStartup() {
             }
             const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
             try {
-                await EmpirePair(number, mockRes);
+                await EmpirePair(number, mockRes, { auto: true });
                 console.log(`Initiated reconnect for ${number}`);
             } catch (error) {
                 console.error(`Failed to reconnect ${number}:`, error);
@@ -2537,6 +2554,7 @@ async function setupCommandHandlers(socket, number) {
     // Socket eka close/logout unama stream/interval eka clear karanawa (memory leak walakwanna)
     socket.ev.on('connection.update', (update) => {
         if (update.connection === 'close') {
+            if (currentSocket.get(sanitizedNumber) !== socket) return;   // 🔧 palaya socket ekak - aluth ekata hani karanna epa
             clearNumberIntervals(sanitizedNumber);
         }
     });
@@ -18649,54 +18667,100 @@ async function ensureAccessKey(number) {
 } 
 function setupAutoRestart(socket, number) {
     const maxReconnectAttempts = 10;
-    let reconnectAttempts = 0;
+    const cleanNum = number.replace(/[^0-9]/g, '');
+    const myToken = resetTokens.get(cleanNum) || 0;
+
+    const dropState = () => {
+        clearNumberIntervals(cleanNum);
+        reqBot.detach(cleanNum);
+        if (activeSockets.get(cleanNum)?.socket === socket) activeSockets.delete(cleanNum);
+        if (currentSocket.get(cleanNum) === socket) currentSocket.delete(cleanNum);
+        socketCreationTime.delete(cleanNum);
+    };
 
     socket.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
-        const cleanNum = number.replace(/[^0-9]/g, '');
-        if (connection === 'close') {
-            // 🧹 leak fix: mala socket eke listeners ain karanawa (reconnect wena hama welawakama ewa gevenawa thibba)
-            try { for (const evName of ['messages.upsert', 'call', 'group-participants.update', 'groups.update']) socket.ev.removeAllListeners?.(evName); } catch (_) { /* ignore */ }
-        }
-        if (connection === 'close' && lastDisconnect?.error?.output?.statusCode === 401) {
-            // logged out: intervals / streams / pending state okkoma ain karanawa
-            clearNumberIntervals(cleanNum);
-            reqBot.detach(cleanNum);
-            activeSockets.delete(cleanNum);
-            socketCreationTime.delete(cleanNum);
+
+        if (connection === 'open') {
+            reconnectCounts.set(cleanNum, 0);
+            console.log(`Connection established for ${number}`);
             return;
         }
-        if (connection === 'close' && lastDisconnect?.error?.output?.statusCode !== 401) {
-            if (reconnectAttempts >= maxReconnectAttempts) {
-                clearNumberIntervals(cleanNum);
-                reqBot.detach(cleanNum);
-                activeSockets.delete(cleanNum);
-                socketCreationTime.delete(cleanNum);
-                return;
+        if (connection !== 'close') return;
+
+        // 🧹 leak fix: mala socket eke listeners ain karanawa
+        try { for (const evName of ['messages.upsert', 'call', 'group-participants.update', 'groups.update']) socket.ev.removeAllListeners?.(evName); } catch (_) { /* ignore */ }
+
+        // palaya socket ekak (aluth ekak hadala thiyenawa / web eken re-pair kala) -> kisima deyak karanna epa
+        if (currentSocket.get(cleanNum) !== socket || (resetTokens.get(cleanNum) || 0) !== myToken) return;
+
+        const code = lastDisconnect?.error?.output?.statusCode;
+
+        // 1) WhatsApp eken logout unu (401) / ban (403) / wena thanaka login una (440): reconnect karanna epa
+        if (code === 401 || code === 403 || code === 440) {
+            dropState();
+            if (code === 401) {
+                // 🔧 FIX: dead creds DB eke thiyagena inna one na. Nattam aluth pair code ekak ganna beri (H12 timeout eka methanin)
+                try {
+                    await Session.updateOne({ number: cleanNum }, { $unset: { creds: 1 } });
+                    const sp = path.join(SESSION_BASE_PATH, `session_${cleanNum}`);
+                    if (fs.existsSync(sp)) fs.removeSync(sp);
+                    if (fs.existsSync(NUMBER_LIST_PATH)) {
+                        const nums = JSON.parse(fs.readFileSync(NUMBER_LIST_PATH, 'utf8')).filter(n => n !== cleanNum);
+                        fs.writeFileSync(NUMBER_LIST_PATH, JSON.stringify(nums, null, 2));
+                    }
+                } catch (e) { console.error(`[restart] cleanup ${cleanNum}:`, e.message); }
+                console.log(`🚪 ${cleanNum} logged out from WhatsApp - session cleared (re-pair karanna)`);
+            } else {
+                console.log(`⛔ ${cleanNum} closed with ${code} - reconnect nawathuwa`);
             }
-            console.log(`Connection lost for ${number}, attempt ${reconnectAttempts + 1}/${maxReconnectAttempts}`);
-            try {
-                await delay(5000 * (reconnectAttempts + 1));
-                activeSockets.delete(number.replace(/[^0-9]/g, ''));
-                socketCreationTime.delete(number.replace(/[^0-9]/g, ''));
-                const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-                await EmpirePair(number, mockRes);
-                reconnectAttempts = 0;
-            } catch (error) {
-                console.error(`Reconnect failed for ${number}:`, error);
-                reconnectAttempts++;
-            }
-        } else if (connection === 'open') {
-            reconnectAttempts = 0;
-            console.log(`Connection established for ${number}`);
+            return;
+        }
+
+        // 2) Kisiwita pair wela nathi socket ekak (pair code expire / waradi number): reconnect loop eka nathara karanawa
+        if (!socket.authState?.creds?.me?.id) {
+            dropState();
+            console.log(`🕒 ${cleanNum} pair karala nathi nisa stop kala (code expire una)`);
+            return;
+        }
+
+        // 3) Hariyatama paired bot ekak, network issue -> backoff ekka reconnect
+        const attempt = (reconnectCounts.get(cleanNum) || 0) + 1;
+        if (attempt > maxReconnectAttempts) {
+            dropState();
+            reconnectCounts.delete(cleanNum);
+            console.log(`❌ ${cleanNum} reconnect ${maxReconnectAttempts} wara fail una - stop`);
+            return;
+        }
+        reconnectCounts.set(cleanNum, attempt);
+        console.log(`Connection lost for ${number}, attempt ${attempt}/${maxReconnectAttempts}`);
+
+        // dead socket eka dan online kiyala pennanna epa (status / panel)
+        if (activeSockets.get(cleanNum)?.socket === socket) activeSockets.delete(cleanNum);
+        clearNumberIntervals(cleanNum);
+
+        await delay(Math.min(5000 * attempt, 60000));
+        // delay eka athule web eken re-pair kala nam / wena socket ekak hadala nam nawathinawa
+        if (currentSocket.get(cleanNum) !== socket || (resetTokens.get(cleanNum) || 0) !== myToken) return;
+        try {
+            socketCreationTime.delete(cleanNum);
+            const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+            await EmpirePair(number, mockRes, { auto: true });
+        } catch (error) {
+            console.error(`Reconnect failed for ${number}:`, error);
         }
     });
 }
-async function EmpirePair(number, res) {
+async function EmpirePair(number, res, opts = {}) {
     const sanitizedNumber = number.replace(/[^0-9]/g, '');
     const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
 
-    await restoreSession(sanitizedNumber);
+    const restored = await restoreSession(sanitizedNumber);
+    // 🔧 FIX: auto reconnect eken pair wela nathi number ekakata pair code request karanna epa (loop / WA spam)
+    if (opts.auto && !restored) {
+        console.log(`⏭️ ${sanitizedNumber} paired session ekak na - skip`);
+        return;
+    }
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
     try {
@@ -18707,6 +18771,7 @@ async function EmpirePair(number, res) {
             version,
             browser: Browsers.macOS('Safari'),
         });
+        currentSocket.set(sanitizedNumber, socket);
 
         // 🛡️ BUG SHIELD: handlers attach wenna *kalin* install karanna oni
         installBugShield(socket, {
@@ -18761,9 +18826,13 @@ async function EmpirePair(number, res) {
             // 🔑 Dashboard login: number + me pairing code eka. Hash karala witharai save karanne
             try { await savePanelPass(sanitizedNumber, code); } catch (e) { console.error('[panel] savePanelPass:', e.message); }
             if (!res.headersSent) res.send({ code });
+        } else if (!opts.auto && !res.headersSent) {
+            // 🔧 FIX: kalin pair wela thiyena session ekak - response ekak nathuwa H12 timeout wenawa wenuwata
+            res.status(409).send({ error: 'Me number eka already linked. Aye try karanna (palaya session eka clear wenawa).' });
         }
         socket.ev.on('creds.update', async () => {
             try {
+                if (currentSocket.get(sanitizedNumber) !== socket) return;   // palaya socket eken creds overwrite wenna epa
                 await saveCreds();
                 const credsPath = path.join(sessionPath, 'creds.json');
                 if (!fs.existsSync(credsPath)) return;
@@ -18778,6 +18847,7 @@ async function EmpirePair(number, res) {
             if (connection === 'open') {
                 try {
                     await delay(3000);
+                    if (currentSocket.get(sanitizedNumber) !== socket) return;   // replace una socket ekak
 
                     const userJid = jidNormalizedUser(socket.user.id);
 
@@ -19014,7 +19084,7 @@ router.post('/slip', async (req, res) => {
 router.get('/connected', (req, res) => {
     const n = String(req.query.number || '').replace(/[^0-9]/g, '');
     const e = activeSockets.get(n);
-    res.json({ connected: !!(e && e.socket && e.socket.user) });
+    res.json({ connected: isLive(e) });
 });
 
 router.get('/status', (req, res) => {
@@ -19022,7 +19092,7 @@ router.get('/status', (req, res) => {
     const mem = process.memoryUsage();
     res.json({
         online: true,
-        bots: [...activeSockets.values()].filter(e => e?.socket?.user).length,
+        bots: [...activeSockets.values()].filter(isLive).length,
         sessions: activeSockets.size,
         uptime: Math.floor(process.uptime()),
         memory: Math.round(mem.rss / 1048576),
@@ -19039,47 +19109,60 @@ router.get('/', async (req, res) => {
         return res.status(400).send({ error: 'Number parameter is required' });
     }
 
-    const sanitizedNumber = number.replace(/[^0-9]/g, '');
+    const sanitizedNumber = String(number).replace(/[^0-9]/g, '');
+    if (!/^[1-9]\d{8,14}$/.test(sanitizedNumber)) {
+        return res.status(400).send({ error: 'Number eka waradi. Country code ekka digits witharak danna (94712345678).' });
+    }
     // ?type=free | pro  (param nathnam pro = kalin wage license gate eka)
     const pairTierReq = String(req.query.type || '').toLowerCase() === 'free' ? 'free' : 'pro';
     pendingPairTier.set(sanitizedNumber, { tier: pairTierReq, ts: Date.now() });
 
-    if (activeSockets.has(sanitizedNumber)) {
-        try {
-            const oldSocket = activeSockets.get(sanitizedNumber);
-            if (oldSocket && oldSocket.socket) {
-                try {
-                    await oldSocket.socket.logout();
-                    oldSocket.socket.end();
-                    oldSocket.socket.ws?.close();
-                } catch (e) {
-                    console.log('Socket close error:', e.message);
-                }
-            }
-            activeSockets.delete(sanitizedNumber);
-            socketCreationTime.delete(sanitizedNumber);
-            await Session.deleteOne({ number: sanitizedNumber });
-            const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
-            if (fs.existsSync(sessionPath)) {
-                fs.removeSync(sessionPath);
-            }
-            if (fs.existsSync(NUMBER_LIST_PATH)) {
-                let numbers = JSON.parse(fs.readFileSync(NUMBER_LIST_PATH, 'utf8'));
-                numbers = numbers.filter(n => n !== sanitizedNumber);
-                fs.writeFileSync(NUMBER_LIST_PATH, JSON.stringify(numbers, null, 2));
-            }
-            console.log(`✅ Old session removed for: ${sanitizedNumber} - Creating new pairing`);
-        } catch (error) {
-            console.error('Error removing old session:', error);
+    // 🔧 FIX 1: response eka kamathi welawakin (25s) yawanawa - Heroku H12 (30s) timeout wenne na
+    const guard = setTimeout(() => {
+        if (!res.headersSent) res.status(504).send({ error: 'WhatsApp server eka slow. Poddak inna aye try karanna.' });
+    }, 25000);
+
+    try {
+        // 🔧 FIX 2: palaya reconnect loops okkoma nawathanawa
+        resetTokens.set(sanitizedNumber, (resetTokens.get(sanitizedNumber) || 0) + 1);
+
+        // 🔧 FIX 3: activeSockets ekata nathath (401 unu / reconnecting) palaya session eka hamawelema clear karanawa.
+        //           kalin: activeSockets.has() nam witharai clear una -> stale creds thibboth code ekak nathuwa hang wenawa
+        const oldEntry = activeSockets.get(sanitizedNumber);
+        const oldSock = currentSocket.get(sanitizedNumber) || oldEntry?.socket;
+        currentSocket.delete(sanitizedNumber);
+        if (oldSock) {
+            try { await Promise.race([oldSock.logout(), delay(4000)]); } catch (e) { console.log('Socket close error:', e.message); }
+            try { oldSock.end(undefined); oldSock.ws?.close(); } catch (e) { /* ignore */ }
         }
+        clearNumberIntervals(sanitizedNumber);
+        reqBot.detach(sanitizedNumber);
+        activeSockets.delete(sanitizedNumber);
+        socketCreationTime.delete(sanitizedNumber);
+        reconnectCounts.delete(sanitizedNumber);
+        await Session.deleteOne({ number: sanitizedNumber });
+        const sessionPath = path.join(SESSION_BASE_PATH, `session_${sanitizedNumber}`);
+        if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath);
+        if (fs.existsSync(NUMBER_LIST_PATH)) {
+            const numbers = JSON.parse(fs.readFileSync(NUMBER_LIST_PATH, 'utf8')).filter(n => n !== sanitizedNumber);
+            fs.writeFileSync(NUMBER_LIST_PATH, JSON.stringify(numbers, null, 2));
+        }
+        if (oldSock || oldEntry) console.log(`✅ Old session removed for: ${sanitizedNumber} - Creating new pairing`);
+    } catch (error) {
+        console.error('Error removing old session:', error);
     }
 
-    await EmpirePair(number, res);
+    try {
+        await EmpirePair(sanitizedNumber, res);
+    } finally {
+        clearTimeout(guard);
+        if (!res.headersSent) res.status(503).send({ error: 'Pair code eka hadanna baha una. Aye try karanna.' });
+    }
 });
 
 process.on('exit', () => {
     activeSockets.forEach((socket, number) => {
-        socket.ws.close();
+        try { socket.socket?.ws?.close(); } catch (_) { /* ignore */ }
         activeSockets.delete(number);
         socketCreationTime.delete(number);
     });
